@@ -16,18 +16,48 @@ const row=(s:HealthSession,userId:string)=>({
   fusion:s.fusion||null,safety:{...(s.safety||{}),answers:s.safetyAnswers||[]},recommendation:s.recommendation||null,feature_vector:s.featureVector||null,quality_score:s.fusion?.confidence||0,
 });
 
+async function persistAlert(client:DataClient,userId:string,session:HealthSession){
+  if(!session.safety||session.safety.severity==='info')return;
+  const code=session.safety.severity==='urgent'?'clinical-red-flag':'health-trend-watch';
+  const {error}=await client.from('health_alerts').upsert({
+    id:`${session.id}:${code}`,
+    user_id:userId,
+    session_id:session.id,
+    severity:session.safety.severity,
+    code,
+    message:session.safety.message,
+  },{onConflict:'id'});
+  if(error)throw error;
+}
+
+async function persistSession(client:DataClient,userId:string,session:HealthSession){
+  const {error}=await client.from('health_sessions').upsert(row(session,userId),{onConflict:'id'});
+  if(error)throw error;
+  await persistAlert(client,userId,session);
+}
+
 export async function saveSession(client:DataClient,userId:string,session:HealthSession){
   const cloud={...session,userId,syncState:'synced' as const};
   try{
-    const {error}=await client.from('health_sessions').upsert(row(cloud,userId),{onConflict:'id'});
-    if(error)throw error; cache(cloud); return {synced:true};
-  }catch(error){enqueue({...session,userId,syncState:'pending'});return {synced:false,error};}
+    await persistSession(client,userId,cloud);
+    cache(cloud);
+    return {synced:true};
+  }catch(error){
+    enqueue({...session,userId,syncState:'pending'});
+    return {synced:false,error};
+  }
 }
 
 export async function syncPending(client:DataClient,userId:string){
   const pending=readJson<HealthSession[]>(PENDING_KEY,[]); if(!pending.length)return 0;
   const remain:HealthSession[]=[];let synced=0;
-  for(const item of pending){try{const {error}=await client.from('health_sessions').upsert(row(item,userId),{onConflict:'id'});if(error)throw error;synced++;cache({...item,userId,syncState:'synced'})}catch{remain.push(item)}}
+  for(const item of pending){
+    try{
+      await persistSession(client,userId,item);
+      synced++;
+      cache({...item,userId,syncState:'synced'});
+    }catch{remain.push(item)}
+  }
   writeJson(PENDING_KEY,remain); return synced;
 }
 
